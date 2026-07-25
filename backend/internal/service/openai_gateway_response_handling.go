@@ -21,6 +21,10 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// errOpenAIUpstreamResponseFailed marks a protocol-complete response.failed
+// terminal event (upstream explicitly declared the response failed).
+var errOpenAIUpstreamResponseFailed = errors.New("openai upstream response failed")
+
 // openaiStreamingResult streaming response result
 type openaiStreamingResult struct {
 	usage            *OpenAIUsage
@@ -335,7 +339,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
 		}
 		if sawFailedEvent {
-			return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
+			// response.failed 是协议完整的失败宣告,不是断流:调用方不得按
+			// "已服务(部分)"结算计费(哨兵错误供 Forward 识别)。
+			return resultWithUsage(), fmt.Errorf("%w: %s", errOpenAIUpstreamResponseFailed, failedMessage)
 		}
 		return resultWithUsage(), nil
 	}
