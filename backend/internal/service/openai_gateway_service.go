@@ -222,6 +222,10 @@ type OpenAIUsage struct {
 type OpenAIForwardResult struct {
 	RequestID  string
 	ResponseID string
+	// StreamAborted marks a streaming response that terminated abnormally but
+	// was settled with the collected usage; scheduling must not count it as
+	// success.
+	StreamAborted bool
 	Usage      OpenAIUsage
 	Model      string // 原始模型（用于响应和日志显示）
 	// BillingModel is the model used for cost calculation.
@@ -273,6 +277,9 @@ type OpenAIForwardResult struct {
 // that may clear model-scoped transient state. The zero value remains a success
 // for existing non-WS callers.
 func (r *OpenAIForwardResult) SucceededForScheduling() bool {
+	if r != nil && r.StreamAborted {
+		return false
+	}
 	if r == nil || !r.OpenAIWSMode || r.UpstreamTerminalEvent == "" {
 		return true
 	}
