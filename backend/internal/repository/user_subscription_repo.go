@@ -340,6 +340,23 @@ func (r *userSubscriptionRepository) ExtendExpiry(ctx context.Context, subscript
 	return translatePersistenceError(err, service.ErrSubscriptionNotFound, nil)
 }
 
+// GetByIDForUpdate loads a subscription with a FOR UPDATE row lock. Renewal
+// paths must recompute the new expiry from this locked read inside the
+// transaction: without the lock, two concurrent fulfillments (same user paying
+// twice, webhook + redeem code, two instances) both read the same old
+// expires_at, both write base+days, and one paid extension is silently lost.
+func (r *userSubscriptionRepository) GetByIDForUpdate(ctx context.Context, subscriptionID int64) (*service.UserSubscription, error) {
+	client := clientFromContext(ctx, r.client)
+	sub, err := client.UserSubscription.Query().
+		Where(usersubscription.IDEQ(subscriptionID)).
+		ForUpdate().
+		Only(ctx)
+	if err != nil {
+		return nil, translatePersistenceError(err, service.ErrSubscriptionNotFound, nil)
+	}
+	return userSubscriptionEntityToService(sub), nil
+}
+
 func (r *userSubscriptionRepository) UpdateStatus(ctx context.Context, subscriptionID int64, status string) error {
 	client := clientFromContext(ctx, r.client)
 	_, err := client.UserSubscription.UpdateOneID(subscriptionID).

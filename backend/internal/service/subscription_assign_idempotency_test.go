@@ -148,6 +148,10 @@ func (userSubRepoNoop) ExistsActiveByUserIDAndGroupID(context.Context, int64, in
 func (userSubRepoNoop) ExtendExpiry(context.Context, int64, time.Time) error {
 	panic("unexpected ExtendExpiry call")
 }
+
+func (userSubRepoNoop) GetByIDForUpdate(context.Context, int64) (*UserSubscription, error) {
+	panic("unexpected GetByIDForUpdate call")
+}
 func (userSubRepoNoop) UpdateStatus(context.Context, int64, string) error {
 	panic("unexpected UpdateStatus call")
 }
@@ -241,6 +245,15 @@ func (s *subscriptionUserSubRepoStub) Create(_ context.Context, sub *UserSubscri
 }
 
 func (s *subscriptionUserSubRepoStub) GetByID(_ context.Context, id int64) (*UserSubscription, error) {
+	sub := s.byID[id]
+	if sub == nil {
+		return nil, ErrSubscriptionNotFound
+	}
+	cp := *sub
+	return &cp, nil
+}
+
+func (s *subscriptionUserSubRepoStub) GetByIDForUpdate(_ context.Context, id int64) (*UserSubscription, error) {
 	sub := s.byID[id]
 	if sub == nil {
 		return nil, ErrSubscriptionNotFound
