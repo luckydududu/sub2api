@@ -961,6 +961,9 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			if !ok {
 				// 上游完成，返回结果
 				if !sawTerminalEvent {
+					// 上游干净 EOF 但缺 message_stop:客户端拿到的是无声截断的
+					// 流,必须补发错误帧,否则严格 SDK 只能靠自身超时感知。
+					sendErrorEvent("stream_incomplete", "upstream stream ended without a terminal event")
 					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
 				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil

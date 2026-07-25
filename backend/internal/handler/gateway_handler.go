@@ -942,7 +942,9 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// - 选中账号与粘性账号一致：刷新 TTL
 			// - 粘性账号因负载/RPM 被跳过、选中了其他账号：不覆盖原绑定，
 			//   下次请求粘性账号恢复后仍可命中
-			if sessionKey != "" && (sessionBoundAccountID == 0 || sessionBoundAccountID == account.ID) {
+			// 异常终止但已结算的流(StreamAborted)不刷新粘性绑定:客户端对
+			// 断流的重试若被钉回同一慢性坏账号,会循环产生部分计费。
+			if sessionKey != "" && (sessionBoundAccountID == 0 || sessionBoundAccountID == account.ID) && (result == nil || !result.StreamAborted) {
 				if err := h.gatewayService.BindStickySession(c.Request.Context(), currentAPIKey.GroupID, sessionKey, account.ID); err != nil {
 					reqLog.Warn("gateway.bind_sticky_session_failed", zap.Int64("account_id", account.ID), zap.Error(err))
 				}
