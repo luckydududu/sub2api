@@ -2161,6 +2161,10 @@ func (stubUserSubscriptionRepo) ExistsActiveByUserIDAndGroupID(ctx context.Conte
 func (stubUserSubscriptionRepo) ExtendExpiry(ctx context.Context, subscriptionID int64, newExpiresAt time.Time) error {
 	return errors.New("not implemented")
 }
+
+func (stubUserSubscriptionRepo) GetByIDForUpdate(ctx context.Context, subscriptionID int64) (*service.UserSubscription, error) {
+	return nil, errors.New("not implemented")
+}
 func (stubUserSubscriptionRepo) UpdateStatus(ctx context.Context, subscriptionID int64, status string) error {
 	return errors.New("not implemented")
 }
