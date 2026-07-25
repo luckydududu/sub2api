@@ -832,7 +832,26 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 					ResponseBody: body,
 				}
 			}
-			return nil, err
+			// 未向客户端输出任何字节的失败会包成 UpstreamFailoverError,请求
+			// 将在其他账号上重试并由重试请求计费,此处不结算,避免重复收费。
+			var failoverErr *UpstreamFailoverError
+			if errors.As(err, &failoverErr) {
+				return nil, err
+			}
+			// 流已开始后的异常终止(上游断流/客户端断开后 drain/缺终止事件/
+			// 读超时):usage 已随 message_start/message_delta 收集,上游已实际
+			// 计量(cache 部分在 message_start 即确定)。此前这里连同 usage 一起
+			// 丢弃并返回错误,handler 不再调 RecordUsage——整笔漏收且不留
+			// usage_log 对账痕迹,与 handleStreamingResponse 各出口"返回已收集
+			// usage 用于计费"的注释意图相矛盾。改为:凡已收集到计费 token 的
+			// 终止性错误,记日志后按已服务(部分)结果继续,让计费如常进行;
+			// 协议层错误事件已在流内发给客户端。
+			if streamResult == nil || !streamUsageHasBillableTokens(streamResult.usage) {
+				return nil, err
+			}
+			logger.LegacyPrintf("service.gateway",
+				"[Forward] stream aborted after usage collected, settling collected usage: Account=%d(%s) error=%v",
+				account.ID, account.Name, err)
 		}
 		usage = streamResult.usage
 		firstTokenMs = streamResult.firstTokenMs
@@ -854,6 +873,27 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		FirstTokenMs:     firstTokenMs,
 		ClientDisconnect: clientDisconnect,
 	}, nil
+}
+
+// streamUsageHasBillableTokens 判断流式收集到的 usage 是否含可计费 token。
+// 用于异常终止的流:只有真的收集到了计量数据才值得按部分结果结算。
+func streamUsageHasBillableTokens(u *ClaudeUsage) bool {
+	if u == nil {
+		return false
+	}
+	return u.InputTokens > 0 || u.OutputTokens > 0 ||
+		u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0 ||
+		u.ImageOutputTokens > 0
+}
+
+// openAIStreamUsageHasBillableTokens 同 streamUsageHasBillableTokens,OpenAI 路径。
+func openAIStreamUsageHasBillableTokens(u *OpenAIUsage) bool {
+	if u == nil {
+		return false
+	}
+	return u.InputTokens > 0 || u.OutputTokens > 0 ||
+		u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0 ||
+		u.ImageInputTokens > 0 || u.ImageOutputTokens > 0
 }
 
 // ResolveChannelMapping 委托渠道服务解析模型映射
