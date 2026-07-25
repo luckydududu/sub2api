@@ -929,6 +929,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		responseID := ""
 		imageCount := 0
 		var imageOutputSizes []string
+		streamAborted := false
 		if reqStream {
 			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
 			if err != nil {
@@ -936,6 +937,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				// 自己会计费,重复结算 = 向客户重复收费。
 				var failoverErr *UpstreamFailoverError
 				if errors.As(err, &failoverErr) {
+					return nil, err
+				}
+				// response.failed 是上游明确宣告的失败(协议完整),不是异常
+				// 断流:不结算,按原错误路径处理(不计费、调度报失败)。
+				if errors.Is(err, errOpenAIUpstreamResponseFailed) {
 					return nil, err
 				}
 				// 流已开始后的异常终止:usage 已收集、上游已实际计量。丢弃它
@@ -948,6 +954,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				logger.LegacyPrintf("service.openai",
 					"[Forward] stream aborted after usage collected, settling collected usage: Account=%d(%s) error=%v",
 					account.ID, account.Name, err)
+				streamAborted = true
 			}
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
@@ -979,6 +986,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 
 		forwardResult := &OpenAIForwardResult{
+			StreamAborted: streamAborted,
 			RequestID:       resp.Header.Get("x-request-id"),
 			ResponseID:      responseID,
 			Usage:           *usage,

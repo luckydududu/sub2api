@@ -846,6 +846,13 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			// 流中断（缺失 terminal 事件、读错误、数据间隔超时等）时保留已观测到的
 			// usage 与错误一起返回，handler 在错误处理完成后照常提交 usage 记录。
 			if partial := partialStreamUsageResult(resp, streamResult, originalModel, mappedModel, startTime, err); partial != nil {
+				// 被结算的中断流不得执行成功侧副作用:粘性会话不刷新绑定、
+				// 调度器不记成功,否则客户端重试会被钉在慢性坏账号上循环产生
+				// 部分计费,且坏账号不降权。
+				partial.StreamAborted = true
+				logger.LegacyPrintf("service.gateway",
+					"[Forward] stream aborted after usage collected, settling collected usage: Account=%d(%s) error=%v",
+					account.ID, account.Name, err)
 				return partial, err
 			}
 			return nil, err
@@ -861,6 +868,8 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}
 
 	return &ForwardResult{
+		// 中断流已在上面经 partialStreamUsageResult 提前返回,走到这里必是正常完成
+		StreamAborted:    false,
 		RequestID:        resp.Header.Get("x-request-id"),
 		Usage:            *usage,
 		Model:            originalModel, // 使用原始模型用于计费和日志

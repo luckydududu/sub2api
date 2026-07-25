@@ -574,6 +574,10 @@ type ForwardResult struct {
 	RequestID string
 	Usage     ClaudeUsage
 	Model     string
+	// StreamAborted marks a streaming response that terminated abnormally but
+	// was settled with the collected usage. Handlers must not treat such a
+	// result as a healthy success signal (no sticky-session binding).
+	StreamAborted bool
 	// UpstreamModel is the actual upstream model after mapping.
 	// Prefer empty when it is identical to Model; persistence normalizes equal values away as no-op mappings.
 	UpstreamModel    string
