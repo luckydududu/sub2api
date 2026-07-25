@@ -280,6 +280,18 @@ func (s *PaymentService) prepDeduct(ctx context.Context, o *dbent.PaymentOrder, 
 		return nil
 	}
 	p.DeductionType = payment.DeductionTypeBalance
+	// TOCTOU guard: RequestRefund validates balance at request time, but the
+	// user can spend it before the admin approves. Silently deducting only
+	// min(refund, balance) while the gateway still refunds the FULL amount
+	// lets the user keep what they already spent. Require an explicit force
+	// so the admin consciously accepts the shortfall.
+	if u.Balance < p.RefundAmount && !force {
+		return &RefundResult{
+			Success:      false,
+			Warning:      fmt.Sprintf("user balance %.2f is less than refund amount %.2f (balance already spent); gateway would still refund in full — use force to accept deducting only the remaining balance", u.Balance, p.RefundAmount),
+			RequireForce: true,
+		}
+	}
 	p.BalanceToDeduct = math.Min(p.RefundAmount, u.Balance)
 	return nil
 }
