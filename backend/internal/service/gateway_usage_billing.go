@@ -771,10 +771,17 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 		Platform:              quotaPlatform,
 	}, s.billingDeps(), s.usageBillingRepo)
 
+	// Persist the usage log regardless of billing outcome. The response was
+	// already served to the client; if billing failed (DB outage/timeout)
+	// AND the log is dropped too, the request becomes invisible free usage
+	// with no reconciliation trail. With the log persisted, unsettled
+	// charges can be found by comparing usage_logs against balance/quota
+	// movements and re-applied afterwards. usage_logs inserts are idempotent
+	// per (request_id, api_key_id), so this cannot double-write.
+	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.gateway")
 	if billingErr != nil {
 		return billingErr
 	}
-	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.gateway")
 
 	return nil
 }
