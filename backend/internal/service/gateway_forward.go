@@ -872,6 +872,17 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	}, nil
 }
 
+
+// openAIStreamUsageHasBillableTokens 判断 OpenAI 流式收集到的 usage 是否含可计费 token。
+func openAIStreamUsageHasBillableTokens(u *OpenAIUsage) bool {
+	if u == nil {
+		return false
+	}
+	return u.InputTokens > 0 || u.OutputTokens > 0 ||
+		u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0 ||
+		u.ImageInputTokens > 0 || u.ImageOutputTokens > 0
+}
+
 // ResolveChannelMapping 委托渠道服务解析模型映射
 func (s *GatewayService) ResolveChannelMapping(ctx context.Context, groupID int64, model string) ChannelMappingResult {
 	if s.channelService == nil {

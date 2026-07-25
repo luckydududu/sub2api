@@ -932,7 +932,22 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		if reqStream {
 			streamResult, err := s.handleStreamingResponseWithReasoning(ctx, resp, c, account, startTime, originalModel, upstreamModel, reasoningEffortValue)
 			if err != nil {
-				return nil, err
+				// 失败会走 failover 的(未向客户端输出)不在此结算——重试请求
+				// 自己会计费,重复结算 = 向客户重复收费。
+				var failoverErr *UpstreamFailoverError
+				if errors.As(err, &failoverErr) {
+					return nil, err
+				}
+				// 流已开始后的异常终止:usage 已收集、上游已实际计量。丢弃它
+				// 意味着整笔漏收且无 usage_log 对账痕迹(与 Anthropic 路径同一
+				// 缺陷)。凡已收集到计费 token 的终止性错误,记日志后按已服务
+				// (部分)结果继续,让计费如常进行。
+				if streamResult == nil || !openAIStreamUsageHasBillableTokens(streamResult.usage) {
+					return nil, err
+				}
+				logger.LegacyPrintf("service.openai",
+					"[Forward] stream aborted after usage collected, settling collected usage: Account=%d(%s) error=%v",
+					account.ID, account.Name, err)
 			}
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
