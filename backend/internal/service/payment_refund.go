@@ -416,12 +416,36 @@ func (s *PaymentService) QueryAndFinalizeRefund(ctx context.Context, oid int64) 
 		return nil, infraerrors.BadRequest("INVALID_STATUS", "only refund pending orders can be finalized")
 	}
 
+	// Atomic occupancy lock (mirrors ExecuteRefund). Without it, concurrent
+	// finalize calls (double click / second instance) both pass the read-only
+	// status check, both see no REFUND_SUCCESS audit log yet, and both apply
+	// the final balance deduction — double-charging the user.
+	locked, err := s.entClient.PaymentOrder.Update().
+		Where(paymentorder.IDEQ(oid), paymentorder.StatusEQ(OrderStatusRefundPending)).
+		SetStatus(OrderStatusRefunding).Save(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("lock: %w", err)
+	}
+	if locked == 0 {
+		return nil, infraerrors.Conflict("CONFLICT", "refund finalization already in progress")
+	}
+	// Release the lock back to REFUND_PENDING on any non-terminal exit so the
+	// finalize can be retried later. Conditional on REFUNDING to avoid
+	// clobbering a terminal status written by markRefundOk/finalizeRefundFailed.
+	restorePending := func() {
+		_, _ = s.entClient.PaymentOrder.Update().
+			Where(paymentorder.IDEQ(oid), paymentorder.StatusEQ(OrderStatusRefunding)).
+			SetStatus(OrderStatusRefundPending).Save(ctx)
+	}
+
 	prov, err := s.getRefundProvider(ctx, o)
 	if err != nil {
+		restorePending()
 		return nil, fmt.Errorf("get refund provider: %w", err)
 	}
 	queryProvider, ok := prov.(payment.RefundQueryProvider)
 	if !ok {
+		restorePending()
 		return nil, infraerrors.BadRequest("REFUND_QUERY_UNSUPPORTED", "this payment provider does not support refund status query; please verify manually")
 	}
 
@@ -435,6 +459,7 @@ func (s *PaymentService) QueryAndFinalizeRefund(ctx context.Context, oid int64) 
 	})
 	finishProviderCall()
 	if err != nil {
+		restorePending()
 		return nil, fmt.Errorf("query refund: %w", err)
 	}
 	if err := validateRefundProviderResponse(resp); err != nil {
@@ -447,16 +472,19 @@ func (s *PaymentService) QueryAndFinalizeRefund(ctx context.Context, oid int64) 
 		plan.SubDaysToDeduct = 0
 	} else if o.OrderType == payment.OrderTypeSubscription {
 		if early := s.prepDeduct(ctx, o, plan, true); early != nil {
+			restorePending()
 			return early, nil
 		}
 	}
 	switch strings.TrimSpace(resp.Status) {
 	case payment.ProviderStatusSuccess, payment.ProviderStatusRefunded:
 		if err := s.applyRefundFinalDeduction(ctx, plan); err != nil {
+			restorePending()
 			return nil, err
 		}
 		return s.markRefundOk(ctx, plan)
 	case payment.ProviderStatusPending:
+		restorePending()
 		s.writeAuditLog(ctx, oid, "REFUND_QUERY_PENDING", "admin", map[string]any{"refundID": resp.RefundID})
 		return &RefundResult{Success: false, Warning: "gateway refund is still pending confirmation"}, nil
 	default:
