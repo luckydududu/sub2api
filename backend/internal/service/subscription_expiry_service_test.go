@@ -75,6 +75,10 @@ func (r *subscriptionExpiryRepoStub) ExtendExpiry(context.Context, int64, time.T
 	return nil
 }
 
+func (r *subscriptionExpiryRepoStub) GetByIDForUpdate(context.Context, int64) (*UserSubscription, error) {
+	return nil, ErrSubscriptionNotFound
+}
+
 func (r *subscriptionExpiryRepoStub) UpdateStatus(context.Context, int64, string) error {
 	return nil
 }
