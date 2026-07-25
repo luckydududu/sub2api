@@ -788,10 +788,21 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 	// Persist the usage log regardless of billing outcome. The response was
 	// already served to the client; if billing failed (DB outage/timeout)
 	// AND the log is dropped too, the request becomes invisible free usage
-	// with no reconciliation trail. With the log persisted, unsettled
-	// charges can be found by comparing usage_logs against balance/quota
-	// movements and re-applied afterwards. usage_logs inserts are idempotent
-	// per (request_id, api_key_id), so this cannot double-write.
+	// with no reconciliation trail. usage_logs inserts are idempotent per
+	// (request_id, api_key_id), so this cannot double-write.
+	//
+	// On billing failure, zero ActualCost before persisting: every stats
+	// query treats actual_cost > 0 as "successfully billed" (see
+	// usageLogSuccessFilterUL), so an unsettled row with a positive
+	// actual_cost would inflate revenue/usage dashboards with money never
+	// collected. actual_cost = 0 aligns with the existing failed-placeholder
+	// semantics; the full cost breakdown fields remain on the row, and
+	// unsettled rows are exactly those without a usage_billing_dedup claim
+	// (the claim rolls back with the failed billing transaction), which is
+	// the reconciliation join for re-applying charges.
+	if billingErr != nil {
+		usageLog.ActualCost = 0
+	}
 	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.gateway")
 	if billingErr != nil {
 		return billingErr
