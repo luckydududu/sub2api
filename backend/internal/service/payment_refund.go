@@ -210,7 +210,11 @@ func (s *PaymentService) PrepareRefund(ctx context.Context, oid int64, amt float
 	if err != nil {
 		return nil, nil, infraerrors.NotFound("NOT_FOUND", "order not found")
 	}
-	ok := []string{OrderStatusCompleted, OrderStatusRefundRequested, OrderStatusRefundPending, OrderStatusRefundFailed}
+	// REFUND_PENDING is deliberately NOT allowed here: it means a gateway
+	// refund is already in flight. Initiating another refund would create a
+	// second real refund at the provider (double payout). Pending refunds
+	// must go through QueryAndFinalizeRefund instead.
+	ok := []string{OrderStatusCompleted, OrderStatusRefundRequested, OrderStatusRefundFailed}
 	if !psSliceContains(ok, o.Status) {
 		return nil, nil, infraerrors.BadRequest("INVALID_STATUS", "order status does not allow refund")
 	}
@@ -281,7 +285,9 @@ func (s *PaymentService) prepDeduct(ctx context.Context, o *dbent.PaymentOrder, 
 }
 
 func (s *PaymentService) ExecuteRefund(ctx context.Context, p *RefundPlan) (*RefundResult, error) {
-	c, err := s.entClient.PaymentOrder.Update().Where(paymentorder.IDEQ(p.OrderID), paymentorder.StatusIn(OrderStatusCompleted, OrderStatusRefundRequested, OrderStatusRefundPending, OrderStatusRefundFailed)).SetStatus(OrderStatusRefunding).Save(ctx)
+	// REFUND_PENDING excluded: an in-flight gateway refund must not be
+	// re-executed (see PrepareRefund).
+	c, err := s.entClient.PaymentOrder.Update().Where(paymentorder.IDEQ(p.OrderID), paymentorder.StatusIn(OrderStatusCompleted, OrderStatusRefundRequested, OrderStatusRefundFailed)).SetStatus(OrderStatusRefunding).Save(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lock: %w", err)
 	}
