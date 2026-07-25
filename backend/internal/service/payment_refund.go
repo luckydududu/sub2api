@@ -424,7 +424,13 @@ func (s *PaymentService) QueryAndFinalizeRefund(ctx context.Context, oid int64) 
 	if err != nil {
 		return nil, infraerrors.NotFound("NOT_FOUND", "order not found")
 	}
-	if o.Status != OrderStatusRefundPending {
+	// A REFUNDING order that stopped moving is a stranded lock (process crash,
+	// or a restore that failed on a cancelled request context). REFUNDING has
+	// no other exit anywhere in the system, so finalize must be able to take
+	// over stale locks or such orders would be stuck forever.
+	staleRefundingCutoff := time.Now().Add(-10 * time.Minute)
+	staleRefunding := o.Status == OrderStatusRefunding && o.UpdatedAt.Before(staleRefundingCutoff)
+	if o.Status != OrderStatusRefundPending && !staleRefunding {
 		return nil, infraerrors.BadRequest("INVALID_STATUS", "only refund pending orders can be finalized")
 	}
 
@@ -433,7 +439,13 @@ func (s *PaymentService) QueryAndFinalizeRefund(ctx context.Context, oid int64) 
 	// status check, both see no REFUND_SUCCESS audit log yet, and both apply
 	// the final balance deduction — double-charging the user.
 	locked, err := s.entClient.PaymentOrder.Update().
-		Where(paymentorder.IDEQ(oid), paymentorder.StatusEQ(OrderStatusRefundPending)).
+		Where(paymentorder.IDEQ(oid), paymentorder.Or(
+			paymentorder.StatusEQ(OrderStatusRefundPending),
+			paymentorder.And(
+				paymentorder.StatusEQ(OrderStatusRefunding),
+				paymentorder.UpdatedAtLT(staleRefundingCutoff),
+			),
+		)).
 		SetStatus(OrderStatusRefunding).Save(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lock: %w", err)
@@ -444,10 +456,17 @@ func (s *PaymentService) QueryAndFinalizeRefund(ctx context.Context, oid int64) 
 	// Release the lock back to REFUND_PENDING on any non-terminal exit so the
 	// finalize can be retried later. Conditional on REFUNDING to avoid
 	// clobbering a terminal status written by markRefundOk/finalizeRefundFailed.
+	// Runs on a cancellation-detached context: the most common failure here is
+	// the admin request timing out / being aborted mid provider-query, and the
+	// restore must still go through or the order strands in REFUNDING.
 	restorePending := func() {
-		_, _ = s.entClient.PaymentOrder.Update().
+		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if _, rerr := s.entClient.PaymentOrder.Update().
 			Where(paymentorder.IDEQ(oid), paymentorder.StatusEQ(OrderStatusRefunding)).
-			SetStatus(OrderStatusRefundPending).Save(ctx)
+			SetStatus(OrderStatusRefundPending).Save(restoreCtx); rerr != nil {
+			slog.Error("refund finalize: failed to restore REFUND_PENDING, order stranded in REFUNDING until stale-lock takeover", "orderID", oid, "error", rerr)
+		}
 	}
 
 	prov, err := s.getRefundProvider(ctx, o)
@@ -529,7 +548,11 @@ func (s *PaymentService) refundFinalizePlan(o *dbent.PaymentOrder) *RefundPlan {
 }
 
 func (s *PaymentService) applyRefundFinalDeduction(ctx context.Context, p *RefundPlan) error {
-	if s.hasAuditLog(ctx, p.OrderID, "REFUND_SUCCESS") {
+	// Retry guards. REFUND_SUCCESS marks a fully finalized refund. The
+	// FINAL_DEDUCTION audit below closes the crash window between a successful
+	// deduction and markRefundOk: without it, a retry (manual status reset or
+	// stale-lock takeover) would deduct the user a second time.
+	if s.hasAuditLog(ctx, p.OrderID, "REFUND_SUCCESS") || s.hasAuditLog(ctx, p.OrderID, "REFUND_FINAL_DEDUCTION_DONE") {
 		p.BalanceToDeduct = 0
 		p.SubDaysToDeduct = 0
 		return nil
@@ -538,6 +561,7 @@ func (s *PaymentService) applyRefundFinalDeduction(ctx context.Context, p *Refun
 		if err := s.userRepo.DeductBalance(ctx, p.Order.UserID, p.BalanceToDeduct); err != nil {
 			return fmt.Errorf("deduction: %w", err)
 		}
+		s.writeAuditLog(ctx, p.OrderID, "REFUND_FINAL_DEDUCTION_DONE", "admin", map[string]any{"balanceDeducted": p.BalanceToDeduct})
 	}
 	if p.DeductionType == payment.DeductionTypeSubscription && p.SubDaysToDeduct > 0 && p.SubscriptionID > 0 {
 		if _, err := s.subscriptionSvc.ExtendSubscription(ctx, p.SubscriptionID, -p.SubDaysToDeduct); err != nil {
