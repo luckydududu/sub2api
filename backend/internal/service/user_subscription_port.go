@@ -25,6 +25,11 @@ type UserSubscriptionRepository interface {
 	ExistsByUserIDAndGroupID(ctx context.Context, userID, groupID int64) (bool, error)
 	ExistsActiveByUserIDAndGroupID(ctx context.Context, userID, groupID int64) (bool, error)
 	ExtendExpiry(ctx context.Context, subscriptionID int64, newExpiresAt time.Time) error
+	// GetByIDForUpdate loads the subscription with a FOR UPDATE row lock.
+	// Renewal paths must recompute the new expiry from this locked read inside
+	// the transaction so concurrent extensions serialize instead of losing
+	// updates (both reading the same stale expires_at).
+	GetByIDForUpdate(ctx context.Context, subscriptionID int64) (*UserSubscription, error)
 	UpdateStatus(ctx context.Context, subscriptionID int64, status string) error
 	UpdateNotes(ctx context.Context, subscriptionID int64, notes string) error
 
