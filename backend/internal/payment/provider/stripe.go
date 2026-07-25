@@ -230,6 +230,11 @@ func (s *Stripe) Refund(ctx context.Context, req payment.RefundRequest) (*paymen
 		Amount:        stripe.Int64(amountInMinorUnit),
 		Reason:        stripe.String(string(stripe.RefundReasonRequestedByCustomer)),
 	}
+	// Deterministic idempotency key: retrying the same logical refund (same
+	// order, same amount) after an ambiguous failure (HTTP timeout, network
+	// error) must not create a second real refund at Stripe. Mirrors the
+	// "pi-<orderID>" key used by CreatePayment.
+	params.SetIdempotencyKey(fmt.Sprintf("refund-%s-%d", req.OrderID, amountInMinorUnit))
 	params.Context = ctx
 
 	r, err := s.sc.V1Refunds.Create(ctx, params)
