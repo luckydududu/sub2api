@@ -646,9 +646,15 @@ func (s *PaymentService) RollbackRefund(ctx context.Context, p *RefundPlan, gErr
 }
 
 func (s *PaymentService) restoreStatus(ctx context.Context, p *RefundPlan) {
+	// Restore the order to its pre-refund status. REFUND_PENDING and
+	// REFUND_FAILED must be preserved as-is: resetting a REFUND_PENDING order
+	// to COMPLETED would erase the fact that a gateway refund is still in
+	// flight — the provider-side refund then completes with no trace in our
+	// books (money out, balance untouched, no reconciliation path).
 	rs := OrderStatusCompleted
-	if p.Order.Status == OrderStatusRefundRequested {
-		rs = OrderStatusRefundRequested
+	switch p.Order.Status {
+	case OrderStatusRefundRequested, OrderStatusRefundPending, OrderStatusRefundFailed:
+		rs = p.Order.Status
 	}
 	_, _ = s.entClient.PaymentOrder.UpdateOneID(p.OrderID).SetStatus(rs).Save(ctx)
 }
