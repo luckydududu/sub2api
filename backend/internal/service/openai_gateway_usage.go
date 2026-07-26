@@ -399,10 +399,18 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 		return err
 	}()
 
+	// Persist the usage log regardless of billing outcome, zeroing ActualCost
+	// on failure so stats (which treat actual_cost > 0 as "successfully
+	// billed") don't count money never collected. Same reconciliation
+	// semantics as GatewayService.recordUsageCore — see the full rationale in
+	// gateway_usage_billing.go.
+	if billingErr != nil {
+		usageLog.ActualCost = 0
+	}
+	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
 	if billingErr != nil {
 		return billingErr
 	}
-	writeUsageLogBestEffort(ctx, s.usageLogRepo, usageLog, "service.openai_gateway")
 
 	return nil
 }
