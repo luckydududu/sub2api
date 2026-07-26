@@ -573,6 +573,9 @@ func (s *PaymentService) applyRefundFinalDeduction(ctx context.Context, p *Refun
 				return fmt.Errorf("deduct subscription days: %w", err)
 			}
 		}
+		// The revoke fallback also consumed the refund's subscription value, so
+		// both outcomes must arm the retry guard above.
+		s.writeAuditLog(ctx, p.OrderID, "REFUND_FINAL_DEDUCTION_DONE", "admin", map[string]any{"subDaysDeducted": p.SubDaysToDeduct, "subscriptionID": p.SubscriptionID})
 	}
 	return nil
 }

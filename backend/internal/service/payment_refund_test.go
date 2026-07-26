@@ -509,3 +509,51 @@ type refundQueryProviderTestDouble struct {
 func (p *refundQueryProviderTestDouble) QueryRefund(context.Context, payment.RefundQueryRequest) (*payment.RefundResponse, error) {
 	return p.refundResponse, nil
 }
+
+type refundSubDeductRepoStub struct {
+	userSubRepoNoop
+
+	extendCalls int
+	expiresAt   time.Time
+}
+
+func (r *refundSubDeductRepoStub) GetByID(context.Context, int64) (*UserSubscription, error) {
+	return &UserSubscription{ID: 7, UserID: 1, GroupID: 1, Status: SubscriptionStatusActive, ExpiresAt: r.expiresAt}, nil
+}
+
+func (r *refundSubDeductRepoStub) ExtendExpiry(_ context.Context, _ int64, newExpiresAt time.Time) error {
+	r.extendCalls++
+	r.expiresAt = newExpiresAt
+	return nil
+}
+
+func TestApplyRefundFinalDeductionSubscriptionRetryDeductsOnce(t *testing.T) {
+	ctx := context.Background()
+	client := newPaymentConfigServiceTestClient(t)
+	repo := &refundSubDeductRepoStub{expiresAt: time.Now().AddDate(0, 0, 60)}
+	svc := &PaymentService{
+		entClient:       client,
+		subscriptionSvc: NewSubscriptionService(groupRepoNoop{}, repo, nil, nil, nil),
+	}
+
+	newPlan := func() *RefundPlan {
+		return &RefundPlan{
+			OrderID:         424242,
+			DeductionType:   payment.DeductionTypeSubscription,
+			SubDaysToDeduct: 30,
+			SubscriptionID:  7,
+		}
+	}
+
+	require.NoError(t, svc.applyRefundFinalDeduction(ctx, newPlan()))
+	require.Equal(t, 1, repo.extendCalls)
+	require.True(t, svc.hasAuditLog(ctx, 424242, "REFUND_FINAL_DEDUCTION_DONE"),
+		"扣天成功必须写终扣审计，否则 markRefundOk 崩溃后的重试会二次扣天")
+
+	// 模拟扣天成功、markRefundOk 写库失败、stale-lock 接管后的重试：
+	// 闸门必须拦住第二次扣天。
+	retry := newPlan()
+	require.NoError(t, svc.applyRefundFinalDeduction(ctx, retry))
+	require.Equal(t, 1, repo.extendCalls, "重试不得再次扣订阅天数")
+	require.Zero(t, retry.SubDaysToDeduct)
+}
