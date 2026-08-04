@@ -536,9 +536,36 @@ func TestApplyRefundFinalDeductionSubscriptionRetryDeductsOnce(t *testing.T) {
 		subscriptionSvc: NewSubscriptionService(groupRepoNoop{}, repo, nil, nil, nil),
 	}
 
+	// claimRefundDeduction 对订单行取锁,行不存在会拒绝——订单必须真实落库。
+	user, err := client.User.Create().
+		SetEmail("retry-deduct@example.com").
+		SetPasswordHash("x").
+		SetUsername("retry-deduct-user").
+		Save(ctx)
+	require.NoError(t, err)
+	order, err := client.PaymentOrder.Create().
+		SetUserID(user.ID).
+		SetUserEmail(user.Email).
+		SetUserName(user.Username).
+		SetAmount(30).
+		SetPayAmount(30).
+		SetFeeRate(0).
+		SetRechargeCode("RETRY-DEDUCT-ORDER").
+		SetOutTradeNo("sub2_retry_deduct_order").
+		SetPaymentType(payment.TypeAlipay).
+		SetPaymentTradeNo("trade-retry-deduct").
+		SetOrderType(payment.OrderTypeSubscription).
+		SetStatus(OrderStatusRefunding).
+		SetExpiresAt(time.Now().Add(time.Hour)).
+		SetPaidAt(time.Now()).
+		SetClientIP("127.0.0.1").
+		SetSrcHost("api.example.com").
+		Save(ctx)
+	require.NoError(t, err)
+
 	newPlan := func() *RefundPlan {
 		return &RefundPlan{
-			OrderID:         424242,
+			OrderID:         order.ID,
 			DeductionType:   payment.DeductionTypeSubscription,
 			SubDaysToDeduct: 30,
 			SubscriptionID:  7,
@@ -547,7 +574,7 @@ func TestApplyRefundFinalDeductionSubscriptionRetryDeductsOnce(t *testing.T) {
 
 	require.NoError(t, svc.applyRefundFinalDeduction(ctx, newPlan()))
 	require.Equal(t, 1, repo.extendCalls)
-	require.True(t, svc.hasAuditLog(ctx, 424242, "REFUND_FINAL_DEDUCTION_DONE"),
+	require.True(t, svc.hasAuditLog(ctx, order.ID, "REFUND_FINAL_DEDUCTION_DONE"),
 		"扣天成功必须写终扣审计，否则 markRefundOk 崩溃后的重试会二次扣天")
 
 	// 模拟扣天成功、markRefundOk 写库失败、stale-lock 接管后的重试：

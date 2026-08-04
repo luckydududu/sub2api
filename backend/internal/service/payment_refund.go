@@ -547,35 +547,206 @@ func (s *PaymentService) refundFinalizePlan(o *dbent.PaymentOrder) *RefundPlan {
 	}
 }
 
+// refundFinalDeductionAuditAction arms the retry guard in
+// applyRefundFinalDeduction. It is written in the SAME transaction as the
+// deduction it guards, so the pair is all-or-nothing.
+const refundFinalDeductionAuditAction = "REFUND_FINAL_DEDUCTION_DONE"
+
+// refundDeductionAlreadyApplied reports whether this order's final deduction
+// already happened (either fully finalized via REFUND_SUCCESS, or applied but
+// not yet marked).
+//
+// It fails CLOSED: a query error propagates instead of being reported as
+// "not applied". Answering false on a transient DB fault would deduct the
+// user a second time, so the guard must never degrade toward re-deducting.
+func (s *PaymentService) refundDeductionAlreadyApplied(ctx context.Context, orderID int64) (bool, error) {
+	n, err := s.auditClient(ctx).PaymentAuditLog.Query().
+		Where(
+			paymentauditlog.OrderIDEQ(strconv.FormatInt(orderID, 10)),
+			paymentauditlog.ActionIn("REFUND_SUCCESS", refundFinalDeductionAuditAction),
+		).
+		Limit(1).Count(ctx)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// auditClient returns the ambient transaction's client when one is in scope,
+// so guard reads and writes stay inside the same transaction (read-your-writes)
+// instead of silently going around it.
+func (s *PaymentService) auditClient(ctx context.Context) *dbent.Client {
+	if tx := dbent.TxFromContext(ctx); tx != nil {
+		return tx.Client()
+	}
+	return s.entClient
+}
+
+// claimRefundDeduction 在事务内取得订单行锁并复查守卫,返回是否应当继续扣减。
+//
+// 只有 applyRefundFinalDeduction 开头那次守卫检查是不够的:陈旧锁接管(finalize
+// 对停摆超过 10 分钟的 REFUNDING 单可接管)会让原执行与接管执行同时在跑,两者可
+// 能都在对方提交守卫审计之前查到"未扣过",各自扣一次。payment_audit_logs 没有唯
+// 一约束,DB 层也兜不住。
+//
+// 这里先对订单行做一次写取得行锁(ent 的 updated_at UpdateDefault 保证是真实写):
+// PostgreSQL 下并发的第二个事务会阻塞到第一个提交,再复查守卫即可看到已提交的审
+// 计行,从而跳过重复扣减。
+//
+// ⚠️ 依赖 READ COMMITTED 隔离级别(PostgreSQL 默认,本项目未设置自定义级别):后到
+// 的事务解除阻塞后必须能读到先到者已提交的审计行。若将来把事务改成 REPEATABLE
+// READ 或 SERIALIZABLE,后到者的快照停在事务开始时刻、看不到那条审计行,本防护会
+// 静默失效,届时必须改用唯一约束等快照无关的手段。
+func (s *PaymentService) claimRefundDeduction(txCtx context.Context, orderID int64) (bool, error) {
+	affected, err := s.auditClient(txCtx).PaymentOrder.Update().
+		Where(paymentorder.IDEQ(orderID)).
+		Save(txCtx)
+	if err != nil {
+		return false, fmt.Errorf("lock order row: %w", err)
+	}
+	if affected == 0 {
+		// 行不存在=锁是空的。放行会退化回无锁的"先查后扣",必须拒绝。
+		return false, fmt.Errorf("lock order row: order %d not found", orderID)
+	}
+	applied, err := s.refundDeductionAlreadyApplied(txCtx, orderID)
+	if err != nil {
+		return false, fmt.Errorf("recheck refund deduction guard: %w", err)
+	}
+	return !applied, nil
+}
+
+// withPaymentTx runs fn inside a transaction, joining an ambient one when the
+// caller already opened it.
+func (s *PaymentService) withPaymentTx(ctx context.Context, fn func(context.Context) error) error {
+	if dbent.TxFromContext(ctx) != nil || s.entClient == nil {
+		return fn(ctx)
+	}
+	tx, err := s.entClient.Tx(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	if err := fn(dbent.NewTxContext(ctx, tx)); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// writeAuditLogErr is the transaction-aware, error-returning counterpart of
+// writeAuditLog. Use it whenever the audit row is load-bearing (a guard rather
+// than a trace) — writeAuditLog swallows its error, which is fine for traces
+// and unacceptable for invariants.
+func (s *PaymentService) writeAuditLogErr(ctx context.Context, oid int64, action, op string, detail map[string]any) error {
+	dj, _ := json.Marshal(detail)
+	_, err := s.auditClient(ctx).PaymentAuditLog.Create().
+		SetOrderID(strconv.FormatInt(oid, 10)).
+		SetAction(action).
+		SetDetail(string(dj)).
+		SetOperator(op).
+		Save(ctx)
+	return err
+}
+
 func (s *PaymentService) applyRefundFinalDeduction(ctx context.Context, p *RefundPlan) error {
-	// Retry guards. REFUND_SUCCESS marks a fully finalized refund. The
-	// FINAL_DEDUCTION audit below closes the crash window between a successful
-	// deduction and markRefundOk: without it, a retry (manual status reset or
-	// stale-lock takeover) would deduct the user a second time.
-	if s.hasAuditLog(ctx, p.OrderID, "REFUND_SUCCESS") || s.hasAuditLog(ctx, p.OrderID, "REFUND_FINAL_DEDUCTION_DONE") {
+	// Retry guard. REFUND_SUCCESS marks a fully finalized refund;
+	// REFUND_FINAL_DEDUCTION_DONE covers the window between a successful
+	// deduction and markRefundOk, so a retry (manual status reset or
+	// stale-lock takeover) cannot deduct the user a second time.
+	applied, err := s.refundDeductionAlreadyApplied(ctx, p.OrderID)
+	if err != nil {
+		return fmt.Errorf("check refund deduction guard: %w", err)
+	}
+	if applied {
 		p.BalanceToDeduct = 0
 		p.SubDaysToDeduct = 0
 		return nil
 	}
 	if p.DeductionType == payment.DeductionTypeBalance && p.BalanceToDeduct > 0 {
-		if err := s.userRepo.DeductBalance(ctx, p.Order.UserID, p.BalanceToDeduct); err != nil {
-			return fmt.Errorf("deduction: %w", err)
+		deducted := false
+		// 扣减与守卫同事务提交:审计写不成则扣减一起回滚,不会留下"扣了但没守卫"
+		// 这个让接管重试双扣的中间态。
+		if err := s.withPaymentTx(ctx, func(txCtx context.Context) error {
+			proceed, err := s.claimRefundDeduction(txCtx, p.OrderID)
+			if err != nil {
+				return err
+			}
+			if !proceed {
+				return nil
+			}
+			if err := s.userRepo.DeductBalance(txCtx, p.Order.UserID, p.BalanceToDeduct); err != nil {
+				return fmt.Errorf("deduction: %w", err)
+			}
+			if err := s.writeAuditLogErr(txCtx, p.OrderID, refundFinalDeductionAuditAction, "admin", map[string]any{"balanceDeducted": p.BalanceToDeduct}); err != nil {
+				return fmt.Errorf("arm refund deduction guard: %w", err)
+			}
+			deducted = true
+			return nil
+		}); err != nil {
+			return err
 		}
-		s.writeAuditLog(ctx, p.OrderID, "REFUND_FINAL_DEDUCTION_DONE", "admin", map[string]any{"balanceDeducted": p.BalanceToDeduct})
+		if !deducted {
+			p.BalanceToDeduct = 0
+		}
 	}
 	if p.DeductionType == payment.DeductionTypeSubscription && p.SubDaysToDeduct > 0 && p.SubscriptionID > 0 {
-		if _, err := s.subscriptionSvc.ExtendSubscription(ctx, p.SubscriptionID, -p.SubDaysToDeduct); err != nil {
-			if errors.Is(err, ErrAdjustWouldExpire) {
-				if revokeErr := s.subscriptionSvc.RevokeSubscription(ctx, p.SubscriptionID); revokeErr != nil {
-					return fmt.Errorf("revoke subscription: %w", revokeErr)
+		// 事务内只做 DB 写,缓存失效一律留到 COMMIT 之后:缓存操作要访问外部
+		// Redis 并跨实例广播,放进事务会让事务被网络 I/O 挂住期间一直持锁,且
+		// 缓存故障会把已完成的扣减一并回滚;此外提交前失效还会让并发读把旧值
+		// 灌回缓存。
+		var cacheUserID, cacheGroupID int64
+		revoked := false
+		deducted := false
+		if err := s.withPaymentTx(ctx, func(txCtx context.Context) error {
+			proceed, err := s.claimRefundDeduction(txCtx, p.OrderID)
+			if err != nil {
+				return err
+			}
+			if !proceed {
+				return nil
+			}
+			if _, uid, gid, err := s.subscriptionSvc.extendSubscriptionDB(txCtx, p.SubscriptionID, -p.SubDaysToDeduct); err != nil {
+				if errors.Is(err, ErrAdjustWouldExpire) {
+					ruid, rgid, revokeErr := s.subscriptionSvc.revokeSubscriptionDB(txCtx, p.SubscriptionID)
+					if revokeErr != nil {
+						return fmt.Errorf("revoke subscription: %w", revokeErr)
+					}
+					cacheUserID, cacheGroupID, revoked = ruid, rgid, true
+				} else {
+					return fmt.Errorf("deduct subscription days: %w", err)
 				}
 			} else {
-				return fmt.Errorf("deduct subscription days: %w", err)
+				cacheUserID, cacheGroupID = uid, gid
+			}
+			// The revoke fallback also consumed the refund's subscription
+			// value, so both outcomes must arm the retry guard.
+			if err := s.writeAuditLogErr(txCtx, p.OrderID, refundFinalDeductionAuditAction, "admin", map[string]any{"subDaysDeducted": p.SubDaysToDeduct, "subscriptionID": p.SubscriptionID}); err != nil {
+				return fmt.Errorf("arm refund deduction guard: %w", err)
+			}
+			deducted = true
+			return nil
+		}); err != nil {
+			return err
+		}
+		if !deducted {
+			p.SubDaysToDeduct = 0
+			return nil
+		}
+		// 提交之后再失效缓存,与各自公开方法(ExtendSubscription /
+		// RevokeSubscription)原有的失效行为保持一致。扣减已落库,此处失败不能
+		// 回退业务结果,记日志即可(缓存最坏随 TTL 自愈)。
+		if cacheUserID > 0 {
+			if revoked {
+				if err := s.subscriptionSvc.invalidateSubscriptionCaches(cacheUserID, cacheGroupID); err != nil {
+					slog.Error("refund final deduction: post-commit subscription cache invalidation failed",
+						"orderID", p.OrderID, "subscriptionID", p.SubscriptionID, "error", err)
+				}
+			} else {
+				s.subscriptionSvc.invalidateSubscriptionCachesAsync(cacheUserID, cacheGroupID)
 			}
 		}
-		// The revoke fallback also consumed the refund's subscription value, so
-		// both outcomes must arm the retry guard above.
-		s.writeAuditLog(ctx, p.OrderID, "REFUND_FINAL_DEDUCTION_DONE", "admin", map[string]any{"subDaysDeducted": p.SubDaysToDeduct, "subscriptionID": p.SubscriptionID})
 	}
 	return nil
 }

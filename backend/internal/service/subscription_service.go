@@ -306,6 +306,9 @@ func (s *SubscriptionService) updateExistingSubscriptionTerm(
 			return fmt.Errorf("lock subscription: %w", err)
 		}
 
+		// 判据含 Status==Expired:状态与时间可能不一致(如兑换码退款先改状态
+		// 再改 expires_at,两次非原子写中间失败),此时订阅业务上已作废,续期
+		// 应从当前时间重算而非在残留的未来 expires_at 上累加。
 		isExpired := lockedSub.Status == SubscriptionStatusExpired || !lockedSub.ExpiresAt.After(startsAt)
 		var newExpiresAt time.Time
 		if !isExpired {
@@ -594,19 +597,34 @@ func normalizeAssignValidityDays(days int) int {
 	return days
 }
 
-// RevokeSubscription 撤销订阅
-func (s *SubscriptionService) RevokeSubscription(ctx context.Context, subscriptionID int64) error {
+// revokeSubscriptionDB 只做 RevokeSubscription 的 DB 部分,返回调用方随后需要失效
+// 的缓存标识。
+//
+// 事务内的调用方必须用它、并在 COMMIT 之后再失效缓存:缓存失效会访问外部
+// Redis(并跨实例广播),放进事务有两个害处——事务被网络 I/O 挂住(最长 5 秒 ×2)
+// 期间一直持锁,以及缓存故障会把已完成的业务写一并回滚。
+func (s *SubscriptionService) revokeSubscriptionDB(ctx context.Context, subscriptionID int64) (userID, groupID int64, err error) {
 	// 先获取订阅信息用于失效缓存
 	sub, err := s.userSubRepo.GetByID(ctx, subscriptionID)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	if err := s.userSubRepo.Delete(ctx, subscriptionID); err != nil {
+		return 0, 0, err
+	}
+
+	return sub.UserID, sub.GroupID, nil
+}
+
+// RevokeSubscription 撤销订阅
+func (s *SubscriptionService) RevokeSubscription(ctx context.Context, subscriptionID int64) error {
+	userID, groupID, err := s.revokeSubscriptionDB(ctx, subscriptionID)
 	if err != nil {
 		return err
 	}
 
-	if err := s.userSubRepo.Delete(ctx, subscriptionID); err != nil {
-		return err
-	}
-
-	if err := s.invalidateSubscriptionCaches(sub.UserID, sub.GroupID); err != nil {
+	if err := s.invalidateSubscriptionCaches(userID, groupID); err != nil {
 		return err
 	}
 
@@ -648,11 +666,12 @@ func (s *SubscriptionService) RestoreSubscription(ctx context.Context, subscript
 	return restored, nil
 }
 
-// ExtendSubscription 调整订阅时长（正数延长，负数缩短）
-func (s *SubscriptionService) ExtendSubscription(ctx context.Context, subscriptionID int64, days int) (*UserSubscription, error) {
+// extendSubscriptionDB 只做 ExtendSubscription 的 DB 部分,返回调用方随后需要失
+// 效的缓存标识。事务内的调用方必须用它,理由同 revokeSubscriptionDB。
+func (s *SubscriptionService) extendSubscriptionDB(ctx context.Context, subscriptionID int64, days int) (*UserSubscription, int64, int64, error) {
 	sub, err := s.userSubRepo.GetByID(ctx, subscriptionID)
 	if err != nil {
-		return nil, ErrSubscriptionNotFound
+		return nil, 0, 0, ErrSubscriptionNotFound
 	}
 
 	// 限制调整天数范围
@@ -668,7 +687,7 @@ func (s *SubscriptionService) ExtendSubscription(ctx context.Context, subscripti
 
 	// 如果订阅已过期，不允许负向调整
 	if isExpired && days < 0 {
-		return nil, infraerrors.BadRequest("CANNOT_SHORTEN_EXPIRED", "cannot shorten an expired subscription")
+		return nil, 0, 0, infraerrors.BadRequest("CANNOT_SHORTEN_EXPIRED", "cannot shorten an expired subscription")
 	}
 
 	// 计算新的过期时间
@@ -687,32 +706,48 @@ func (s *SubscriptionService) ExtendSubscription(ctx context.Context, subscripti
 
 	// 检查新的过期时间必须大于当前时间
 	if !newExpiresAt.After(now) {
-		return nil, ErrAdjustWouldExpire
+		return nil, 0, 0, ErrAdjustWouldExpire
 	}
 
 	if err := s.userSubRepo.ExtendExpiry(ctx, subscriptionID, newExpiresAt); err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 
 	// 如果订阅已过期，恢复为active状态
 	if sub.Status == SubscriptionStatusExpired {
 		if err := s.userSubRepo.UpdateStatus(ctx, subscriptionID, SubscriptionStatusActive); err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
 	}
 
-	// 失效订阅缓存
-	s.InvalidateSubCache(sub.UserID, sub.GroupID)
+	updated, err := s.userSubRepo.GetByID(ctx, subscriptionID)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return updated, sub.UserID, sub.GroupID, nil
+}
+
+// invalidateSubscriptionCachesAsync 是 ExtendSubscription 原有的缓存失效行为
+// (L1 同步 + billing 缓存异步),抽出来供 DB 部分的调用方在事务提交后复用。
+func (s *SubscriptionService) invalidateSubscriptionCachesAsync(userID, groupID int64) {
+	s.InvalidateSubCache(userID, groupID)
 	if s.billingCacheService != nil {
-		userID, groupID := sub.UserID, sub.GroupID
 		go func() {
 			cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = s.billingCacheService.InvalidateSubscription(cacheCtx, userID, groupID)
 		}()
 	}
+}
 
-	return s.userSubRepo.GetByID(ctx, subscriptionID)
+// ExtendSubscription 调整订阅时长（正数延长，负数缩短）
+func (s *SubscriptionService) ExtendSubscription(ctx context.Context, subscriptionID int64, days int) (*UserSubscription, error) {
+	updated, userID, groupID, err := s.extendSubscriptionDB(ctx, subscriptionID, days)
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateSubscriptionCachesAsync(userID, groupID)
+	return updated, nil
 }
 
 // GetByID 根据ID获取订阅

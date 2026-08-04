@@ -17,6 +17,16 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// openAIStreamUsageHasBillableTokens 判断 OpenAI 流式收集到的 usage 是否含可计费 token。
+func openAIStreamUsageHasBillableTokens(u *OpenAIUsage) bool {
+	if u == nil {
+		return false
+	}
+	return u.InputTokens > 0 || u.OutputTokens > 0 ||
+		u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0 ||
+		u.ImageInputTokens > 0 || u.ImageOutputTokens > 0
+}
+
 // Forward forwards request to OpenAI API
 func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
 	clearGrokResponsesClientToolMapping(c)

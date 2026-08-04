@@ -23,7 +23,14 @@ import (
 
 // errOpenAIUpstreamResponseFailed marks a protocol-complete response.failed
 // terminal event (upstream explicitly declared the response failed).
-var errOpenAIUpstreamResponseFailed = errors.New("openai upstream response failed")
+//
+// The text must stay exactly "upstream response failed" so that
+// fmt.Errorf("%w: %s", ...) reproduces the historical message byte for byte:
+// openAIForwardErrorAlreadyCommunicated classifies this error by
+// strings.HasPrefix("upstream response failed:"), and any prefix drift makes
+// the handler append a fallback error frame onto a stream that already
+// delivered the response.failed event.
+var errOpenAIUpstreamResponseFailed = errors.New("upstream response failed")
 
 // openaiStreamingResult streaming response result
 type openaiStreamingResult struct {

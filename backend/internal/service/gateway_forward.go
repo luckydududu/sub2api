@@ -846,9 +846,11 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			// 流中断（缺失 terminal 事件、读错误、数据间隔超时等）时保留已观测到的
 			// usage 与错误一起返回，handler 在错误处理完成后照常提交 usage 记录。
 			if partial := partialStreamUsageResult(resp, streamResult, originalModel, mappedModel, startTime, err); partial != nil {
-				// 被结算的中断流不得执行成功侧副作用:粘性会话不刷新绑定、
-				// 调度器不记成功,否则客户端重试会被钉在慢性坏账号上循环产生
-				// 部分计费,且坏账号不降权。
+				// 被结算的中断流不得执行成功侧副作用。本路径当前唯一的成功侧
+				// 副作用是粘性会话绑定(见 gateway_handler 的 BindStickySession):
+				// 不置此标记,客户端对断流的重试会被钉回同一慢性坏账号,循环产生
+				// 部分计费。Anthropic 侧没有 OpenAI 的 ReportAccountScheduleResult
+				// 那样的调度反馈,故此处不涉及调度成功信号。
 				partial.StreamAborted = true
 				logger.LegacyPrintf("service.gateway",
 					"[Forward] stream aborted after usage collected, settling collected usage: Account=%d(%s) error=%v",
@@ -879,17 +881,6 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		FirstTokenMs:     firstTokenMs,
 		ClientDisconnect: clientDisconnect,
 	}, nil
-}
-
-
-// openAIStreamUsageHasBillableTokens 判断 OpenAI 流式收集到的 usage 是否含可计费 token。
-func openAIStreamUsageHasBillableTokens(u *OpenAIUsage) bool {
-	if u == nil {
-		return false
-	}
-	return u.InputTokens > 0 || u.OutputTokens > 0 ||
-		u.CacheCreationInputTokens > 0 || u.CacheReadInputTokens > 0 ||
-		u.ImageInputTokens > 0 || u.ImageOutputTokens > 0
 }
 
 // ResolveChannelMapping 委托渠道服务解析模型映射
